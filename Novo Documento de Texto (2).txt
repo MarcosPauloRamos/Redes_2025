@@ -1,0 +1,289 @@
+/* projeto_redes_misto.cc
+   Topologia: Server -- P2P -- Router -- P2P -- AP
+   AP serves WiFi stations (clientes).
+   Suporta: UDP, TCP, MISTO; clientes fixos ou moveis; 1..50 clientes.
+   Gera FlowMonitor XML e CSV com métricas por fluxo.
+*/
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/wifi-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/flow-monitor-module.h"
+
+#include <fstream>
+#include <iomanip>
+
+using namespace ns3;
+
+int
+main (int argc, char *argv[])
+{
+  // ----- Parâmetros padrão (podem ser alterados via linha de comando) -----
+  std::string trafego = "UDP";    // "UDP", "TCP", "MISTO"
+  bool clientesMoveis = false;
+  uint32_t nClients = 5;          // 1..50
+  double simTime = 20.0;          // segundos (padrão escolhido)
+  std::string outputPrefix = "saida";
+
+  CommandLine cmd;
+  cmd.AddValue ("trafego", "Tipo de trafego: UDP, TCP, MISTO", trafego);
+  cmd.AddValue ("moveis", "Clientes moveis? (true/false)", clientesMoveis);
+  cmd.AddValue ("nClients", "Numero de clientes (1..50)", nClients);
+  cmd.AddValue ("simTime", "Tempo total de simulacao (s)", simTime);
+  cmd.AddValue ("outputPrefix", "Prefixo para arquivos de saida", outputPrefix);
+  cmd.Parse (argc, argv);
+
+  if (nClients < 1) nClients = 1;
+  if (nClients > 50) nClients = 50;
+
+  // ----- Criacao dos nos -----
+  NodeContainer serverNode;
+  serverNode.Create (1);
+
+  NodeContainer routerNode;
+  routerNode.Create (1);
+
+  NodeContainer apNode;
+  apNode.Create (1); // este sera o nodo do AP (conectado ao router via p2p)
+
+  NodeContainer staNodes;
+  staNodes.Create (nClients);
+
+  // ----- Links ponto-a-ponto -----
+  PointToPointHelper p2p;
+  p2p.SetDeviceAttribute ("DataRate", StringValue ("100Mbps"));
+  p2p.SetChannelAttribute ("Delay", StringValue ("2ms"));
+
+  // Server <-> Router
+  NetDeviceContainer devServerRouter = p2p.Install (serverNode.Get(0), routerNode.Get(0));
+
+  // Router <-> AP
+  NetDeviceContainer devRouterAp = p2p.Install (routerNode.Get(0), apNode.Get(0));
+
+  // ----- WiFi (AP + STAs) -----
+  YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default ();
+  YansWifiPhyHelper wifiPhy = YansWifiPhyHelper::Default ();
+  wifiPhy.SetChannel (wifiChannel.Create ());
+
+  WifiHelper wifi;
+  wifi.SetStandard (WIFI_PHY_STANDARD_80211g);
+  wifi.SetRemoteStationManager ("ns3::AarfWifiManager");
+
+  Ssid ssid = Ssid ("rede-simulacao");
+  WifiMacHelper wifiMac;
+
+  // STA (clientes)
+  wifiMac.SetType ("ns3::StaWifiMac",
+                   "Ssid", SsidValue (ssid),
+                   "ActiveProbing", BooleanValue (false));
+  NetDeviceContainer staDevices = wifi.Install (wifiPhy, wifiMac, staNodes);
+
+  // AP
+  wifiMac.SetType ("ns3::ApWifiMac",
+                   "Ssid", SsidValue (ssid));
+  NetDeviceContainer apDevice = wifi.Install (wifiPhy, wifiMac, apNode);
+
+  // ----- Mobilidade -----
+  MobilityHelper mobility;
+  Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator> ();
+
+  // posição do servidor e router/ap (fixas)
+  // colocar AP em (0,0)
+  mobility.SetPositionAllocator (positionAlloc);
+  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  mobility.Install (serverNode);
+  mobility.Install (routerNode);
+  mobility.Install (apNode);
+
+  serverNode.Get(0)->GetObject<MobilityModel> ()->SetPosition (Vector(-50.0, 0.0, 0.0));
+  routerNode.Get(0)->GetObject<MobilityModel> ()->SetPosition (Vector(-25.0, 0.0, 0.0));
+  apNode.Get(0)->GetObject<MobilityModel> ()->SetPosition (Vector(0.0, 0.0, 0.0));
+
+  if (clientesMoveis)
+    {
+      MobilityHelper mobilitySta;
+      mobilitySta.SetPositionAllocator ("ns3::RandomRectanglePositionAllocator",
+                                       "X", StringValue ("ns3::UniformRandomVariable[Min=-20.0|Max=20.0]"),
+                                       "Y", StringValue ("ns3::UniformRandomVariable[Min=-20.0|Max=20.0]"));
+      mobilitySta.SetMobilityModel ("ns3::RandomWalk2dMobilityModel",
+                                   "Bounds", RectangleValue (Rectangle (-30, 30, -30, 30)));
+      mobilitySta.Install (staNodes);
+    }
+  else
+    {
+      MobilityHelper mobilitySta;
+      mobilitySta.SetPositionAllocator ("ns3::GridPositionAllocator",
+                                       "MinX", DoubleValue (-10.0),
+                                       "MinY", DoubleValue (-10.0),
+                                       "DeltaX", DoubleValue (5.0),
+                                       "DeltaY", DoubleValue (5.0),
+                                       "GridWidth", UintegerValue (10),
+                                       "LayoutType", StringValue ("RowFirst"));
+      mobilitySta.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+      mobilitySta.Install (staNodes);
+    }
+
+  // ----- Pilha de protocolos e enderecamento -----
+  InternetStackHelper stack;
+  stack.InstallAll ();
+
+  // enderecos: 10.1.1.0/24 server-router
+  Ipv4AddressHelper address;
+  address.SetBase ("10.1.1.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifServerRouter = address.Assign (devServerRouter);
+
+  // router-ap: 10.1.2.0/24
+  address.SetBase ("10.1.2.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifRouterAp = address.Assign (devRouterAp);
+
+  // wifi: 10.1.3.0/24
+  address.SetBase ("10.1.3.0", "255.255.255.0");
+  Ipv4InterfaceContainer ifWifiSta = address.Assign (staDevices);
+  Ipv4InterfaceContainer ifAp = address.Assign (apDevice);
+
+  // ----- Roteamento (para permitir envio de server -> wifi) -----
+  Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
+
+  // ----- Aplicacoes: portas -----
+  uint16_t portUdp = 9000;
+  uint16_t portTcp = 9001;
+
+  // Instalar servidores no "serverNode" (servidor cabeado) para MISTO/UDP/TCP
+  // UDP server
+  UdpServerHelper udpServer (portUdp);
+  ApplicationContainer serverAppsUdp = udpServer.Install (serverNode.Get(0));
+  serverAppsUdp.Start (Seconds (0.5));
+  serverAppsUdp.Stop (Seconds (simTime + 1.0));
+
+  // TCP server (PacketSink)
+  Address sinkLocal (InetSocketAddress (Ipv4Address::GetAny (), portTcp));
+  PacketSinkHelper tcpSinkHelper ("ns3::TcpSocketFactory", sinkLocal);
+  ApplicationContainer serverAppsTcp = tcpSinkHelper.Install (serverNode.Get(0));
+  serverAppsTcp.Start (Seconds (0.5));
+  serverAppsTcp.Stop (Seconds (simTime + 1.0));
+
+  // Clientes: Para simplicidade, associaremos alguns clientes a UDP e alguns a TCP
+  // Distribuicao: se MISTO -> metade dos clientes geram UDP, metade TCP (se impar, ultimo faz UDP)
+  uint32_t nUdpClients = 0;
+  uint32_t nTcpClients = 0;
+  if (trafego == "UDP")
+    {
+      nUdpClients = nClients;
+      nTcpClients = 0;
+    }
+  else if (trafego == "TCP")
+    {
+      nUdpClients = 0;
+      nTcpClients = nClients;
+    }
+  else // MISTO
+    {
+      nUdpClients = nClients / 2 + (nClients % 2);
+      nTcpClients = nClients - nUdpClients;
+    }
+
+  // ---- Criar aplicações UDP nos primeiros nUdpClients sta nodes ----
+  for (uint32_t i = 0; i < nUdpClients; ++i)
+    {
+      // cada UDP client aponta para o servidor IP (ifServerRouter.GetAddress(0))
+      UdpClientHelper udpClient (ifServerRouter.GetAddress (0), portUdp);
+      udpClient.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+      udpClient.SetAttribute ("Interval", TimeValue (MilliSeconds (50))); // pacotes a cada 50 ms
+      udpClient.SetAttribute ("PacketSize", UintegerValue (1024));
+
+      ApplicationContainer clientApps = udpClient.Install (staNodes.Get (i));
+      clientApps.Start (Seconds (1.0));
+      clientApps.Stop (Seconds (simTime));
+    }
+
+  // ---- Criar aplicações TCP (OnOff) nos próximos nTcpClients sta nodes ----
+  for (uint32_t j = 0; j < nTcpClients; ++j)
+    {
+      uint32_t idx = nUdpClients + j;
+      OnOffHelper tcpClient ("ns3::TcpSocketFactory", Address ());
+      AddressValue remoteAddress (InetSocketAddress (ifServerRouter.GetAddress (0), portTcp));
+      tcpClient.SetAttribute ("Remote", remoteAddress);
+      tcpClient.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1]"));
+      tcpClient.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0]"));
+      tcpClient.SetAttribute ("DataRate", DataRateValue (DataRate ("5Mbps")));
+      tcpClient.SetAttribute ("PacketSize", UintegerValue (1024));
+
+      ApplicationContainer clientApps = tcpClient.Install (staNodes.Get (idx));
+      clientApps.Start (Seconds (1.0));
+      clientApps.Stop (Seconds (simTime));
+    }
+
+  // ----- FlowMonitor para coletar métricas -----
+  FlowMonitorHelper flowmonHelper;
+  Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll ();
+
+  // Opcional: ativar pcap
+  // p2p.EnablePcapAll ("projeto_redes");
+
+  // ----- Executa simulacao -----
+  Simulator::Stop (Seconds (simTime + 1.0));
+  Simulator::Run ();
+
+  // ----- Coleta estatísticas e grava CSV + XML -----
+  monitor->CheckForLostPackets ();
+  Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier> (flowmonHelper.GetClassifier ());
+  std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats ();
+
+  // Arquivos de saida com prefixo e parametros
+  std::ostringstream oss;
+  oss << outputPrefix << "_" << trafego << "_" << (clientesMoveis ? "moveis" : "fixos")
+      << "_" << nClients;
+  std::string baseName = oss.str ();
+  std::string xmlName = baseName + ".xml";
+  std::string csvName = baseName + ".csv";
+
+  // Serializa xml (FlowMonitor)
+  monitor->SerializeToXmlFile (xmlName, true, true);
+
+  // Abre CSV e escreve header
+  std::ofstream csv (csvName.c_str ());
+  csv << "FlowId,Proto,SourceIP,SourcePort,DestIP,DestPort,TxBytes,RxBytes,TxPackets,RxPackets,Throughput_Mbps,AvgDelay_s,LostPackets,LossRate\n";
+  csv << std::fixed << std::setprecision (6);
+
+  for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator i = stats.begin (); i != stats.end (); ++i)
+    {
+      FlowId flowId = i->first;
+      FlowMonitor::FlowStats flowStats = i->second;
+      Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (flowId);
+
+      std::string proto = (t.protocol == 6 ? "TCP" : (t.protocol == 17 ? "UDP" : "OTHER")); // 6 TCP, 17 UDP
+
+      double rxBytes = flowStats.rxBytes;
+      double throughput = (rxBytes * 8.0) / simTime / 1e6; // Mbps
+      double avgDelay = 0.0;
+      if (flowStats.rxPackets > 0)
+        {
+          avgDelay = flowStats.delaySum.GetSeconds () / flowStats.rxPackets;
+        }
+      uint64_t lost = flowStats.lostPackets;
+      double lossRate = 0.0;
+      uint64_t txPackets = flowStats.txPackets;
+      if (txPackets > 0)
+        lossRate = double (lost) / double (txPackets);
+
+      csv << flowId << "," << proto << ","
+          << t.sourceAddress << "," << t.sourcePort << ","
+          << t.destinationAddress << "," << t.destinationPort << ","
+          << flowStats.txBytes << "," << flowStats.rxBytes << ","
+          << flowStats.txPackets << "," << flowStats.rxPackets << ","
+          << throughput << "," << avgDelay << "," << lost << "," << lossRate << "\n";
+    }
+
+  csv.close ();
+
+  Simulator::Destroy ();
+
+  // Mensagem final
+  std::cout << "Simulacao finalizada. Arquivos gerados: " << xmlName << " , " << csvName << std::endl;
+
+  return 0;
+}
