@@ -1,0 +1,30 @@
+ linhas 67 a 75 
+eros: 
+O método Default() foi removido; agora o helper é criado vazio.
+
+WIFI_PHY_STANDARD_80211g virou WifiPhyStandard::WIFI_STANDARD_80211g.
+
+A linha SetPcapDataLinkType é opcional, mas boa prática para gerar os arquivos .pcap corretos.
+troquei por 
+// ----- WiFi (AP + STAs) -----
+YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default();
+
+// Em versões novas do ns-3, o método Default() do PhyHelper foi removido.
+// Agora criamos o objeto diretamente, sem o método.
+YansWifiPhyHelper wifiPhy;
+wifiPhy.SetChannel(wifiChannel.Create());
+
+// Definimos o padrão Wi-Fi usando o novo enum (WifiPhyStandard)
+WifiHelper wifi;
+//wifi.SetStandard(WIFI_PHY_STANDARD_80211g); -> retirei essa parte
+wifi.SetRemoteStationManager("ns3::AarfWifiManager");
+
+
+Rodei novamente, deu erro na linha 77
+:
+error: ‘WifiPhyStandard’ has not been declared
+significa que o compilador ainda não sabe o que é WifiPhyStandard, porque falta incluir o cabeçalho certo no início do seu arquivo.
+concerto:
+No início do seu arquivo projeto_redes_misto.cc, logo depois das primeiras includes (por exemplo, depois de #include "ns3/core-module.h"), adicione esta linha:
+
+#include "ns3/wifi-standards.h"
